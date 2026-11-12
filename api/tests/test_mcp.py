@@ -3,10 +3,15 @@ import os
 import socket
 import sys
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 import uvicorn
+from sqlalchemy import select
+
+from app.models.integration import IntegrationToken
+from app.models.user import User
 
 pytest.importorskip("mcp")
 from mcp import ClientSession, StdioServerParameters  # noqa: E402
@@ -329,3 +334,73 @@ async def test_builtin_server_cannot_be_enabled_without_sdk(integration_api, mon
             json={"enabled": True},
         )
         assert response.status_code == 409
+
+
+async def test_http_transport_rejects_revoked_token_on_subsequent_request(integration_api):
+    client, csrf, factory = integration_api
+    token = await token_for(client, csrf, write=True)
+    backend = InventoryClient("http://test", transport=httpx.ASGITransport(app=app))
+    application = AuthenticateHTTP(create_server(backend).streamable_http_app(), backend)
+
+    async with serve(application) as base_url:
+        async with httpx.AsyncClient() as http:
+            headers = {"Authorization": f"Bearer {token}"}
+            # A harmless unauthenticated MCP request is expected to be rejected only
+            # by the MCP protocol after the outer bearer-token check succeeds.
+            first = await http.post(f"{base_url}/mcp", headers=headers, json={})
+            assert first.status_code != 401
+
+            async with factory() as session:
+                record = await session.scalar(select(IntegrationToken))
+                assert record is not None
+                record.revoked_at = datetime.now(UTC)
+                await session.commit()
+
+            rejected = await http.post(f"{base_url}/mcp", headers=headers, json={})
+            assert rejected.status_code == 401
+
+
+async def test_http_transport_rejects_expired_token(integration_api):
+    client, csrf, factory = integration_api
+    token = await token_for(client, csrf, write=True)
+    backend = InventoryClient("http://test", transport=httpx.ASGITransport(app=app))
+    application = AuthenticateHTTP(create_server(backend).streamable_http_app(), backend)
+
+    async with factory() as session:
+        record = await session.scalar(select(IntegrationToken))
+        assert record is not None
+        record.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+
+    async with serve(application) as base_url:
+        async with httpx.AsyncClient() as http:
+            response = await http.post(
+                f"{base_url}/mcp",
+                headers={"Authorization": f"Bearer {token}"},
+                json={},
+            )
+            assert response.status_code == 401
+
+
+async def test_http_transport_rejects_deactivated_account(integration_api):
+    client, csrf, factory = integration_api
+    token = await token_for(client, csrf, write=True)
+    backend = InventoryClient("http://test", transport=httpx.ASGITransport(app=app))
+    application = AuthenticateHTTP(create_server(backend).streamable_http_app(), backend)
+
+    async with factory() as session:
+        record = await session.scalar(select(IntegrationToken))
+        assert record is not None
+        user = await session.get(User, record.user_id)
+        assert user is not None
+        user.is_active = False
+        await session.commit()
+
+    async with serve(application) as base_url:
+        async with httpx.AsyncClient() as http:
+            response = await http.post(
+                f"{base_url}/mcp",
+                headers={"Authorization": f"Bearer {token}"},
+                json={},
+            )
+            assert response.status_code == 401
